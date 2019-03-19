@@ -1,2 +1,5 @@
-# goonce-queue-nats
-igoonce.iqueue implementation using NATS
+# goonce-queues-nats
+
+igoonce.iqueues implementation using NATS
+
+
