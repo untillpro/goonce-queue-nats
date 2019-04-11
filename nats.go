@@ -112,7 +112,7 @@ func (w *natsWorker) reqRespNats(data interface{}, partitionKey string, timeout 
 }
 
 var airBoView iqueues.NonPartyHandler = func(ctx context.Context, queueID string, request *iqueues.Request) *iqueues.Response {
-
+	return nil
 }
 
 //TODO nats reducer stuff with this maps
