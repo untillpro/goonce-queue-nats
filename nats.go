@@ -8,7 +8,9 @@ import (
 	"github.com/untillpro/godif"
 	"github.com/untillpro/igoonce/iconfig"
 	"github.com/untillpro/igoonce/iqueues"
+	"hash/fnv"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -47,13 +49,19 @@ func Init(ctx context.Context) (context.Context, error) {
 	if err != nil {
 		return nil, err
 	}
-	opts := []nats.Option{nats.Name("NatsQueues")}
+	opts := setupConnOptions([]nats.Option{})
 	natsConn, err := nats.Connect(config.Servers, opts...)
 	if err != nil {
 		return nil, err
 	}
 	worker := natsWorker{&config, natsConn}
 	return context.WithValue(ctx, natsConnection, worker), nil
+}
+
+//TODO close connection to nats
+// should we stop the context?
+func Finit(ctx context.Context) error {
+	return nil
 }
 
 //TODO recreate http.Request to our Request with Args=*http.Request or pass partitionKey to method or read mux.Vars() (gorilla-mux specific)
@@ -70,6 +78,7 @@ func invokeFromHTTPRequest(ctx context.Context, request *iqueues.Request, respon
 	if request.PartitionDividend == 0 {
 		resp = worker.reqRespNats(body, request.QueueID, timeout)
 	} else {
+		request.PartitionNumber, err = calculatePartitionNumber(request.QueueID, request.PartitionDividend)
 		resp = worker.reqRespNats(body, request.QueueID+strconv.Itoa(request.PartitionNumber), timeout)
 	}
 	data := resp.Data.([]byte)
@@ -81,7 +90,6 @@ func invokeFromHTTPRequest(ctx context.Context, request *iqueues.Request, respon
 
 func (w *natsWorker) reqRespNats(data interface{}, partitionKey string, timeout time.Duration) *iqueues.Response {
 	conn := w.conn
-	var resp iqueues.Response
 	var body []byte
 	var err error
 	switch data.(type) {
@@ -90,29 +98,87 @@ func (w *natsWorker) reqRespNats(data interface{}, partitionKey string, timeout 
 	default:
 		body, err = json.Marshal(data)
 		if err != nil {
-			resp.Status = http.StatusText(http.StatusBadRequest)
-			resp.StatusCode = http.StatusBadRequest
-			resp.Data = "Can't marshal request body!"
-			return &resp
+			return createResponse(http.StatusBadRequest, "can't marshal request body")
 		}
 	}
 	msg, err := conn.Request(partitionKey, body, timeout)
 	if err != nil {
-		resp.Status = http.StatusText(http.StatusRequestTimeout)
-		resp.StatusCode = http.StatusRequestTimeout
+		resp := createResponse(http.StatusRequestTimeout, "request timeout")
 		if conn.LastError() != nil {
 			resp.Data = conn.LastError().Error()
 		}
-		return &resp
+		return resp
 	}
-	resp.Status = http.StatusText(http.StatusOK)
-	resp.StatusCode = http.StatusOK
-	resp.Data = msg.Data
-	return &resp
+	return createResponse(http.StatusOK, msg.Data)
 }
 
+func InitConnection(ctx context.Context, partitionName string) *nats.Conn {
+
+}
+
+//TODO no need to return *Response and pass *Request
+// need to create one conn for each handler and reuse it
+// we need Handler interface and structs with *nats.Conn
 var airBoView iqueues.NonPartyHandler = func(ctx context.Context, queueID string, request *iqueues.Request) *iqueues.Response {
+	worker := ctx.Value(natsConnection).(natsWorker)
+	conn := worker.conn
+	_, err := conn.Subscribe(queueID, func(msg *nats.Msg) {
+		//no need to check errors, we just got timeout request in publisher
+		// maybe we need it later
+		conn.Publish(msg.Reply, []byte("airBoView"))
+	})
+	err = conn.Flush()
+
+	if err = conn.LastError(); err != nil {
+		//TODO need to log it and maybe try to reconnect
+		log.Fatal(err)
+	}
+
+	log.Printf("Subscriber for subject %s created and waits for request", queueID)
 	return nil
 }
 
-//TODO nats reducer stuff with this maps
+//TODO here we can create new connection for PartitionHandler, try to connect, if success return handler, if failure
+// return error *Response
+// i should start connections here? Handler structs for partitionDivident num?
+var factory iqueues.PartitionHandlerFactory = func(ctx context.Context, queueID string, partitionDividend int,
+	partitionNumber int) (handler *iqueues.PartitionHandler, err *iqueues.Response) {
+
+	return nil, &iqueues.Response{}
+}
+
+func calculatePartitionNumber(queueID string, partitionDividend int) (int, error) {
+	h := fnv.New32a()
+	_, err := h.Write([]byte(queueID))
+	if err != nil {
+		return 0, err
+	}
+	return int(h.Sum32()) % partitionDividend, nil
+}
+
+func createResponse(HTTPStatusCode int, data interface{}) *iqueues.Response {
+	return &iqueues.Response{
+		Status:     http.StatusText(HTTPStatusCode),
+		StatusCode: HTTPStatusCode,
+		Data:       data,
+	}
+}
+
+//TODO refactor
+func setupConnOptions(opts []nats.Option) []nats.Option {
+	totalWait := 10 * time.Minute
+	reconnectDelay := time.Second
+
+	opts = append(opts, nats.ReconnectWait(reconnectDelay))
+	opts = append(opts, nats.MaxReconnects(int(totalWait/reconnectDelay)))
+	opts = append(opts, nats.DisconnectHandler(func(nc *nats.Conn) {
+		log.Printf("Disconnected: will attempt reconnects for %.0fm", totalWait.Minutes())
+	}))
+	opts = append(opts, nats.ReconnectHandler(func(nc *nats.Conn) {
+		log.Printf("Reconnected [%s]", nc.ConnectedUrl())
+	}))
+	opts = append(opts, nats.ClosedHandler(func(nc *nats.Conn) {
+		log.Fatal("Exiting, no servers available")
+	}))
+	return opts
+}
