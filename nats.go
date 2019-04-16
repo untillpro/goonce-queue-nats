@@ -9,7 +9,6 @@ import (
 	"github.com/untillpro/godif"
 	"github.com/untillpro/igoonce/iconfig"
 	"github.com/untillpro/igoonce/iqueues"
-	"hash/fnv"
 	"log"
 	"net/http"
 	"strconv"
@@ -40,11 +39,10 @@ type natsWorker struct {
 }
 
 type natsSubscriber struct {
-	queueID           string
-	partitionDividend int
-	numOfPartition    int
-	partitionsNumber  int
-	worker            *natsWorker
+	queueID          string
+	numOfPartition   int
+	partitionsNumber int
+	worker           *natsWorker
 }
 
 type natsQueueKey int
@@ -67,7 +65,7 @@ func connectSubscribers(conf *NatsConfig) (subscribers []*natsSubscriber, err er
 		if err != nil {
 			return nil, err
 		}
-		subscriber := &natsSubscriber{k, 0, 0, 0, worker}
+		subscriber := &natsSubscriber{k, 0, 0, worker}
 		subscribers = append(subscribers, subscriber)
 	}
 	for k := range partitionHandlerFactories {
@@ -77,16 +75,12 @@ func connectSubscribers(conf *NatsConfig) (subscribers []*natsSubscriber, err er
 		if err != nil {
 			return nil, err
 		}
-		partitionDividend, _, err := calculatePartitionNumber(k, numOfPartitions)
-		if err != nil {
-			return nil, err
-		}
 		for i := 0; i < numOfPartitions; i++ {
-			worker, err := connectToNats(conf, fmt.Sprintf("%s_%d", queueName, i))
+			worker, err := connectToNats(conf, queueName+strconv.Itoa(i))
 			if err != nil {
 				return nil, err
 			}
-			subscribers = append(subscribers, &natsSubscriber{k, partitionDividend, i, numOfPartitions, worker})
+			subscribers = append(subscribers, &natsSubscriber{k, i, numOfPartitions, worker})
 		}
 	}
 	return subscribers, nil
@@ -123,16 +117,41 @@ func Init(ctx context.Context) (context.Context, error) {
 	return context.WithValue(ctx, natsPublish, worker), nil
 }
 
-func (v *natsSubscriber) createNatsHandler(handler interface{}) nats.MsgHandler {
+func (v *natsSubscriber) createNatsNonPartyHandler(ctx context.Context,
+	handler func(ctx context.Context, req *iqueues.Request) *iqueues.Response) nats.MsgHandler {
 	nc := v.worker.conn
 	return func(msg *nats.Msg) {
 		req := iqueues.Request{
-			QueueID:           msg.Subject,
-			PartitionNumber:   v.numOfPartition,
-			PartitionDividend: v.partitionDividend,
-			Args:              msg.Data,
+			QueueID:         msg.Subject,
+			PartitionNumber: v.numOfPartition,
+			Args:            msg.Data,
 		}
 		resp := handler(ctx, &req)
+		data, err := json.Marshal(resp)
+		if err != nil {
+			//do smth with error
+			log.Fatal(err)
+		}
+		nc.Publish(msg.Reply, data)
+	}
+}
+
+func (v *natsSubscriber) createNatsPartitionedHandler(ctx context.Context, handlerFactory iqueues.PartitionHandlerFactory) nats.MsgHandler {
+	nc := v.worker.conn
+	return func(msg *nats.Msg) {
+		//msg data may be *iqueues.Request JSON
+		req := iqueues.Request{
+			QueueID:         msg.Subject,
+			PartitionNumber: v.numOfPartition,
+			Args:            msg.Data,
+		}
+		var handler iqueues.PartitionHandler
+		handler, ok := partitionHandlers[v.queueID+strconv.Itoa(v.numOfPartition)]
+		if !ok {
+			//we need dividend
+			handler = handlerFactory(ctx, msg.Subject, 0, v.numOfPartition)
+		}
+		resp := handler.Handle(ctx, &req)
 		data, err := json.Marshal(resp)
 		if err != nil {
 			//do smth with error
@@ -147,41 +166,15 @@ func Start(ctx context.Context) {
 	for _, v := range subscribers {
 		var natsHandler nats.MsgHandler
 		if v.partitionsNumber == 0 {
-			nc := v.worker.conn
 			handler := nonPartyHandlers[v.queueID]
-			natsHandler = func(msg *nats.Msg) {
-				req := iqueues.Request{
-					QueueID: msg.Subject,
-					Args:    msg.Data,
-				}
-				resp := handler(ctx, &req)
-				data, err := json.Marshal(resp)
-				if err != nil {
-					//do smth with error
-					log.Fatal(err)
-				}
-				nc.Publish(msg.Reply, data)
-			}
+			natsHandler = v.createNatsNonPartyHandler(ctx, handler)
 		} else {
-			if val, ok := partitionHandlers[fmt.Sprintf("%s_%d", v.queueID, v.numOfPartition)]; ok {
-				val.Handle(ctx)
-			} else {
-
-			}
-			handlerFactory := v.queueID
-			natsHandler = func(msg *nats.Msg) {
-				req := iqueues.Request{
-					QueueID: msg.Subject,
-					Args:    msg.Data,
-				}
-				resp := handlerFactory(ctx)
-				data, err := json.Marshal(resp)
-				if err != nil {
-					//do smth with error
-					log.Fatal(err)
-				}
-				worker.conn.Publish(msg.Reply, data)
-			}
+			factory := partitionHandlerFactories[v.queueID+strconv.Itoa(v.numOfPartition)]
+			natsHandler = v.createNatsPartitionedHandler(ctx, factory)
+		}
+		err := v.worker.subscribe(natsHandler)
+		if err != nil {
+			log.Fatal(err)
 		}
 	}
 }
@@ -210,6 +203,7 @@ func Finit(ctx context.Context) error {
 
 func invokeFromHTTPRequest(ctx context.Context, request *iqueues.Request, response http.ResponseWriter, timeout time.Duration) {
 	worker := ctx.Value(natsPublish).(natsWorker)
+	//no []byte, just JSON *iqueues.Request
 	HTTPRequestBody := request.Args.([]byte)
 	queueNameAndPartitionNumber := strings.Split(request.QueueID, ":")
 	if len(queueNameAndPartitionNumber) == 0 {
@@ -224,7 +218,6 @@ func invokeFromHTTPRequest(ctx context.Context, request *iqueues.Request, respon
 	if numOfPartitions == 0 {
 		resp = worker.reqRespNats(HTTPRequestBody, request.QueueID, timeout)
 	} else {
-		request.PartitionNumber, request.PartitionDividend, err = calculatePartitionNumber(request.QueueID, numOfPartitions)
 		resp = worker.reqRespNats(HTTPRequestBody, queueNameAndPartitionNumber[0]+strconv.Itoa(request.PartitionNumber), timeout)
 	}
 	data := resp.Data.([]byte)
@@ -272,16 +265,6 @@ var airBoView iqueues.NonPartyHandler = func(ctx context.Context, request *iqueu
 var factory iqueues.PartitionHandlerFactory = func(ctx context.Context, queueID string, partitionDividend int,
 	partitionNumber int) (handler *iqueues.PartitionHandler, err *iqueues.Response) {
 	return nil, &iqueues.Response{}
-}
-
-func calculatePartitionNumber(queueID string, numOfPartitions int) (partitionDividend int, partitionNumber int, err error) {
-	h := fnv.New32a()
-	_, err = h.Write([]byte(queueID))
-	if err != nil {
-		return 0, 0, err
-	}
-	partitionDividend = int(h.Sum32())
-	return partitionDividend, partitionDividend % numOfPartitions, nil
 }
 
 func createResponse(HTTPStatusCode int, data interface{}) *iqueues.Response {
