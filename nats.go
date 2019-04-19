@@ -120,6 +120,7 @@ func Init(ctx context.Context) (context.Context, error) {
 	return context.WithValue(ctx, natsPublish, worker), nil
 }
 
+//TODO testing delete unnecessary
 func (v *natsSubscriber) createNatsNonPartyHandler(ctx context.Context,
 	handler func(ctx context.Context, req *iqueues.Request) *iqueues.Response) nats.MsgHandler {
 	nc := v.worker.conn
@@ -190,18 +191,7 @@ func Start(ctx context.Context) {
 func (w *natsWorker) subscribe(handler nats.MsgHandler) error {
 	conn := w.conn
 	_, err := conn.Subscribe(conn.Opts.Name, handler)
-	if err != nil {
-		//TODO no need to stop all, just one subscribtion
-		log.Println("problem in subs")
-		return err
-	}
 	err = conn.Flush()
-	if err != nil {
-		//TODO no need to stop all, just one subscribtion
-		log.Println("problem in subs with flush")
-		return err
-	}
-
 	if err = conn.LastError(); err != nil {
 		//TODO no need to stop all, just one subscribtion
 		return err
@@ -240,7 +230,7 @@ func invokeFromHTTPRequest(ctx context.Context, request *iqueues.Request, respon
 	gochips.Info(fmt.Sprintf("Queue name: %s; number of partitions: %d", queueNameAndPartitionNumber[0], numOfPartitions))
 	var resp iqueues.Response
 	if numOfPartitions == 0 {
-		resp = worker.reqRespNats(reqData, request.QueueID, timeout)
+		resp = worker.reqRespNats(reqData, queueNameAndPartitionNumber[0], timeout)
 	} else {
 		resp = worker.reqRespNats(reqData, queueNameAndPartitionNumber[0]+strconv.Itoa(request.PartitionNumber), timeout)
 	}
@@ -257,7 +247,6 @@ func invokeFromHTTPRequest(ctx context.Context, request *iqueues.Request, respon
 	if err != nil {
 		http.Error(response, "can't write response", http.StatusBadRequest)
 	}
-	log.Println("resp sent")
 }
 
 func (w *natsWorker) reqRespNats(data []byte, partitionKey string, timeout time.Duration) iqueues.Response {
