@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -29,7 +30,7 @@ var partitionHandlerFactories = make(map[string]iqueues.PartitionHandlerFactory)
 var nonPartyHandlers = make(map[string]iqueues.NonPartyHandler)
 
 //TODO sync
-var partitionHandlers map[string]iqueues.PartitionHandler
+var partitionHandlers sync.Map
 
 type NatsConfig struct {
 	Servers string
@@ -45,6 +46,7 @@ type natsSubscriber struct {
 	numOfPartition   int
 	partitionsNumber int
 	worker           *natsWorker
+	subscription     *nats.Subscription
 }
 
 type natsQueueKey int
@@ -58,18 +60,17 @@ func connectPublisher(conf *NatsConfig) (worker *natsWorker, err error) {
 	return connectToNats(conf, "NatsPublisher")
 }
 
+//TODO do we have to return from method if one subscriber fails?
 func connectSubscribers(conf *NatsConfig) (subscribers []*natsSubscriber, err error) {
 	subscribers = make([]*natsSubscriber, 0)
 	for k := range nonPartyHandlers {
 		queueAndPartition := strings.Split(k, ":")
 		queueName := queueAndPartition[0]
 		worker, err := connectToNats(conf, queueName)
-		log.Println("sub", queueName, "connected to nats")
 		if err != nil {
-			return nil, err
+			return subscribers, err
 		}
-		subscriber := &natsSubscriber{k, 0, 0, worker}
-		subscribers = append(subscribers, subscriber)
+		subscribers = append(subscribers, &natsSubscriber{k, 0, 0, worker, nil})
 	}
 	for k := range partitionHandlerFactories {
 		queueAndPartition := strings.Split(k, ":")
@@ -81,12 +82,24 @@ func connectSubscribers(conf *NatsConfig) (subscribers []*natsSubscriber, err er
 		for i := 0; i < numOfPartitions; i++ {
 			worker, err := connectToNats(conf, queueName+strconv.Itoa(i))
 			if err != nil {
-				return nil, err
+				return subscribers, err
 			}
-			subscribers = append(subscribers, &natsSubscriber{k, i, numOfPartitions, worker})
+			subscribers = append(subscribers, &natsSubscriber{k, i, numOfPartitions, worker, nil})
 		}
 	}
 	return subscribers, nil
+}
+
+func unsubscribe(subscribers []*natsSubscriber) {
+	for _, s := range subscribers {
+		s.subscription.Unsubscribe()
+	}
+}
+
+func disconnectSubscribers(subscribers []*natsSubscriber) {
+	for _, s := range subscribers {
+		s.worker.conn.Close()
+	}
 }
 
 func connectToNats(conf *NatsConfig, connectionName string) (worker *natsWorker, err error) {
@@ -100,71 +113,75 @@ func connectToNats(conf *NatsConfig, connectionName string) (worker *natsWorker,
 	return worker, nil
 }
 
+//TODO do we have to return nil ctx?
 func Init(ctx context.Context) (context.Context, error) {
 	var config NatsConfig
 	err := iconfig.GetCurrentAppConfig(ctx, &config)
 	if err != nil {
 		return nil, err
 	}
-	workers, err := connectSubscribers(&config)
+	subs, err := connectSubscribers(&config)
 	if err != nil {
-		//TODO don't forget to release resources
+		disconnectSubscribers(subs)
 		return nil, err
 	}
-	ctx = context.WithValue(ctx, natsSubscribe, workers)
-	worker, err := connectPublisher(&config)
+	ctx = context.WithValue(ctx, natsSubscribe, subs)
+	pub, err := connectPublisher(&config)
 	if err != nil {
-		//TODO don't forget to release resources
+		disconnectSubscribers(subs)
 		return nil, err
 	}
-	return context.WithValue(ctx, natsPublish, worker), nil
+	return context.WithValue(ctx, natsPublish, pub), nil
 }
 
-//TODO testing delete unnecessary
-func (v *natsSubscriber) createNatsNonPartyHandler(ctx context.Context,
+//TODO do smth with errors
+func (ns *natsSubscriber) createNatsNonPartyHandler(ctx context.Context,
 	handler func(ctx context.Context, req *iqueues.Request) *iqueues.Response) nats.MsgHandler {
-	nc := v.worker.conn
+	nc := ns.worker.conn
 	return func(msg *nats.Msg) {
 		var req iqueues.Request
 		err := json.Unmarshal(msg.Data, &req)
 		if err != nil {
-			//do smth with error
-			log.Fatal(err)
+			gochips.Info(err)
+			return
 		}
 		resp := handler(ctx, &req)
 		data, err := json.Marshal(resp)
 		if err != nil {
-			//do smth with error
-			log.Fatal(err)
+			gochips.Info(err)
+			return
 		}
 		nc.Publish(msg.Reply, data)
 	}
 }
 
-func (v *natsSubscriber) createNatsPartitionedHandler(ctx context.Context, handlerFactory iqueues.PartitionHandlerFactory) nats.MsgHandler {
-	nc := v.worker.conn
+//TODO do smth with errors
+func (ns *natsSubscriber) createNatsPartitionedHandler(ctx context.Context, handlerFactory iqueues.PartitionHandlerFactory) nats.MsgHandler {
+	nc := ns.worker.conn
 	return func(msg *nats.Msg) {
 		var req iqueues.Request
 		err := json.Unmarshal(msg.Data, &req)
 		if err != nil {
-			//do smth with error
-			log.Fatal(err)
+			gochips.Info(err)
+			return
 		}
-		var handler iqueues.PartitionHandler
 		var errResp *iqueues.Response
-		handler, ok := partitionHandlers[v.queueID+strconv.Itoa(v.numOfPartition)]
+		key := ns.queueID + strconv.Itoa(ns.numOfPartition)
+		handler, ok := partitionHandlers.Load(key)
 		if !ok {
+			log.Println("Create handler for partition number", ns.numOfPartition)
 			handler, errResp = handlerFactory(ctx, req.QueueID, req.PartitionDividend, req.PartitionNumber)
+			partitionHandlers.Store(key, handler)
 		}
 		if errResp != nil {
-			//do smth with error
-			log.Fatal(errResp)
+			gochips.Info(err)
+			return
 		}
-		resp := handler.Handle(ctx, &req)
+		resp := handler.(iqueues.PartitionHandler).Handle(ctx, &req)
 		data, err := json.Marshal(resp)
 		if err != nil {
-			//do smth with error
-			log.Fatal(err)
+			gochips.Info(err)
+			return
 		}
 		nc.Publish(msg.Reply, data)
 	}
@@ -178,36 +195,40 @@ func Start(ctx context.Context) {
 			handler := nonPartyHandlers[v.queueID]
 			natsHandler = v.createNatsNonPartyHandler(ctx, handler)
 		} else {
-			factory := partitionHandlerFactories[v.queueID+strconv.Itoa(v.numOfPartition)]
+			factory := partitionHandlerFactories[v.queueID]
 			natsHandler = v.createNatsPartitionedHandler(ctx, factory)
 		}
-		err := v.worker.subscribe(natsHandler)
+		err := v.subscribe(natsHandler)
 		if err != nil {
-			log.Fatal(err)
+			v.worker.conn.Close()
+			gochips.Info(err)
 		}
 	}
 }
 
-func (w *natsWorker) subscribe(handler nats.MsgHandler) error {
-	conn := w.conn
-	_, err := conn.Subscribe(conn.Opts.Name, handler)
+func (ns *natsSubscriber) subscribe(handler nats.MsgHandler) (err error) {
+	conn := ns.worker.conn
+	ns.subscription, err = conn.Subscribe(conn.Opts.Name, handler)
 	err = conn.Flush()
 	if err = conn.LastError(); err != nil {
-		//TODO no need to stop all, just one subscribtion
 		return err
 	}
+	log.Println("Subscribe for subj", conn.Opts.Name)
 	return nil
 }
 
-//TODO unsubscribe
 func Stop(ctx context.Context) {
-
+	subscribers := ctx.Value(natsSubscribe).([]*natsSubscriber)
+	unsubscribe(subscribers)
 }
 
 //TODO close connection to nats
 // should we stop the context?
-func Finit(ctx context.Context) error {
-	return nil
+func Finit(ctx context.Context) {
+	subscribers := ctx.Value(natsSubscribe).([]*natsSubscriber)
+	disconnectSubscribers(subscribers)
+	publisher := ctx.Value(natsPublish).(*natsWorker)
+	publisher.conn.Close()
 }
 
 func invokeFromHTTPRequest(ctx context.Context, request *iqueues.Request, response http.ResponseWriter, timeout time.Duration) {
@@ -227,64 +248,31 @@ func invokeFromHTTPRequest(ctx context.Context, request *iqueues.Request, respon
 		http.Error(response, "wrong QueueID", http.StatusBadRequest)
 		return
 	}
-	gochips.Info(fmt.Sprintf("Queue name: %s; number of partitions: %d", queueNameAndPartitionNumber[0], numOfPartitions))
-	var resp iqueues.Response
+	var respFromNats []byte
 	if numOfPartitions == 0 {
-		resp = worker.reqRespNats(reqData, queueNameAndPartitionNumber[0], timeout)
+		respFromNats, err = worker.reqRespNats(reqData, queueNameAndPartitionNumber[0], timeout)
 	} else {
-		resp = worker.reqRespNats(reqData, queueNameAndPartitionNumber[0]+strconv.Itoa(request.PartitionNumber), timeout)
+		respFromNats, err = worker.reqRespNats(reqData, queueNameAndPartitionNumber[0]+strconv.Itoa(request.PartitionNumber), timeout)
 	}
-	if resp.StatusCode != 200 {
-		http.Error(response, resp.Status, resp.StatusCode)
-		return
-	}
-	respData, err := json.Marshal(resp)
 	if err != nil {
-		http.Error(response, "can't marshal request body", http.StatusBadRequest)
-		return
+		http.Error(response, "error from nats resp", http.StatusBadRequest)
 	}
-	_, err = fmt.Fprint(response, respData)
+	_, err = fmt.Fprint(response, string(respFromNats))
 	if err != nil {
 		http.Error(response, "can't write response", http.StatusBadRequest)
 	}
 }
 
-func (w *natsWorker) reqRespNats(data []byte, partitionKey string, timeout time.Duration) iqueues.Response {
+func (w *natsWorker) reqRespNats(data []byte, partitionKey string, timeout time.Duration) (resp []byte, err error) {
 	conn := w.conn
 	msg, err := conn.Request(partitionKey, data, timeout)
 	if err != nil {
-		log.Println(err)
-		resp := createResponse(http.StatusRequestTimeout, "request timeout")
 		if conn.LastError() != nil {
-			resp.Data = conn.LastError().Error()
+			err = conn.LastError()
 		}
-		return resp
+		return nil, err
 	}
-	return createResponse(http.StatusOK, msg.Data)
-}
-
-var airBoView iqueues.NonPartyHandler = func(ctx context.Context, request *iqueues.Request) *iqueues.Response {
-	return &iqueues.Response{
-		Status:     http.StatusText(http.StatusOK),
-		StatusCode: http.StatusOK,
-		Data:       fmt.Sprintf("Received message from %s with args: %s", request.QueueID, request.Args),
-	}
-}
-
-//TODO here we can create new connection for PartitionHandler, try to connect, if success return handler, if failure
-// return error *Response
-// i should start connections here? Handler structs for partitionDivident num?
-var factory iqueues.PartitionHandlerFactory = func(ctx context.Context, queueID string, partitionDividend int,
-	partitionNumber int) (handler iqueues.PartitionHandler, err *iqueues.Response) {
-	return nil, &iqueues.Response{}
-}
-
-func createResponse(HTTPStatusCode int, data interface{}) iqueues.Response {
-	return iqueues.Response{
-		Status:     http.StatusText(HTTPStatusCode),
-		StatusCode: HTTPStatusCode,
-		Data:       data,
-	}
+	return msg.Data, nil
 }
 
 //TODO refactor
