@@ -10,5 +10,3 @@ require (
 	github.com/untillpro/godif v0.2.0
 	github.com/untillpro/igoonce v0.7.0
 )
-
-replace github.com/untillpro/igoonce => ../fork/igoonce
