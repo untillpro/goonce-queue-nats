@@ -21,6 +21,10 @@ github.com/untillpro/godif v0.2.0 h1:To9VAOacW5iDmJBbv6ugeGVVMruF4ybOQ1RQ5ava0TE
 github.com/untillpro/godif v0.2.0/go.mod h1:8/dbnhMGMZ2TMvPwBvGMrvg5ELL4VW4jmr1SOuarx2I=
 github.com/untillpro/igoonce v0.7.0 h1:H2N2evLaEoulKxz9j/0AC02TINsvH485o2mjYVaC3aQ=
 github.com/untillpro/igoonce v0.7.0/go.mod h1:FB89FTyPGl+sOSibPdjsJbnttwIXKYH3+8UiAbyblCY=
+github.com/untillpro/igoonce v0.8.0 h1:8jXlF5srXm0MlcTHw8pO9hcl9SIvVZ7JAwlkEw+Zteg=
+github.com/untillpro/igoonce v0.8.0/go.mod h1:FB89FTyPGl+sOSibPdjsJbnttwIXKYH3+8UiAbyblCY=
+github.com/untillpro/igoonce v0.9.0 h1:GblCnN6QKYRIx/JMffQdtIo+YLVsPnpUL3525PqQ1nw=
+github.com/untillpro/igoonce v0.9.0/go.mod h1:FB89FTyPGl+sOSibPdjsJbnttwIXKYH3+8UiAbyblCY=
 golang.org/x/crypto v0.0.0-20181203042331-505ab145d0a9 h1:mKdxBk7AujPs8kU4m80U72y/zjbZ3UcXC7dClwKbUI0=
 golang.org/x/crypto v0.0.0-20181203042331-505ab145d0a9/go.mod h1:6SG95UA2DQfeDnfUPMdvaQW0Q7yPrPDi9nlGo2tz2b4=
 golang.org/x/sys v0.0.0-20190405154228-4b34438f7a67 h1:1Fzlr8kkDLQwqMP8GxrhptBLqZG/EDpiATneiZHY998=
