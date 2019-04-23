@@ -171,7 +171,7 @@ func (ns *natsSubscriber) createNatsPartitionedHandler(ctx context.Context, hand
 		if !ok {
 			log.Println("Create handler for partition number", ns.numOfPartition)
 			handler, errResp = handlerFactory(ctx, req.QueueID, req.PartitionDividend, req.PartitionNumber)
-			partitionHandlers.Store(key, handler)
+			partitionHandlers.LoadOrStore(key, handler)
 		}
 		if errResp != nil {
 			gochips.Info(err)
