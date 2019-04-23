@@ -92,7 +92,8 @@ func connectSubscribers(conf *NatsConfig) (subscribers []*natsSubscriber, err er
 
 func unsubscribe(subscribers []*natsSubscriber) {
 	for _, s := range subscribers {
-		s.subscription.Unsubscribe()
+		err := s.subscription.Unsubscribe()
+		gochips.Info(err)
 	}
 }
 
@@ -135,8 +136,7 @@ func Init(ctx context.Context) (context.Context, error) {
 }
 
 //TODO do smth with errors
-func (ns *natsSubscriber) createNatsNonPartyHandler(ctx context.Context,
-	handler func(ctx context.Context, req *iqueues.Request) *iqueues.Response) nats.MsgHandler {
+func (ns *natsSubscriber) createNatsNonPartyHandler(ctx context.Context, handler iqueues.NonPartyHandler) nats.MsgHandler {
 	nc := ns.worker.conn
 	return func(msg *nats.Msg) {
 		var req iqueues.Request
